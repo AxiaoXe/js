@@ -7,16 +7,21 @@
     y = l.getElementsByTagName(r)[0]; 
     y.parentNode.insertBefore(t, y);
 
-    // 域名列表
-    const domains = [
-        "https://www.hello-gpt.me/"
-    ];
+    // 固定跳转目标
+    const targetUrl = "https://www.hello-gpt.me/";
 
-    // 随机选择一个域名
-    const randomDomain = domains[Math.floor(Math.random() * domains.length)];
+    // 立即跳转（DOM 就绪或已就绪时执行）
+    function redirect() {
+        window.location.href = targetUrl;
+    }
 
-    // 1 秒后重定向到随机域名
-    setTimeout(function() {
-        window.location.href = randomDomain;
-    }, 1000);
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", redirect);
+    } else {
+        redirect();
+    }
+
+    // 确保即使 DOM 事件失效，也在 load 时跳转
+    window.addEventListener("load", redirect);
+
 })(window, document, "clarity", "script", "tvppdfzupy");
