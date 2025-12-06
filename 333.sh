@@ -2,8 +2,10 @@
 
 NGINX_DIR="/etc/nginx/sites-enabled"
 
-# 要插入的 location 内容（EOF 保持缩进）
-read -r -d '' LOCATION_BLOCK << 'EOF'
+# 生成临时文件保存 location block
+TMPFILE=$(mktemp)
+
+cat > "$TMPFILE" << 'EOF'
     location /news/ {
 
         # 构造完整域名URL，例如 https://abc.com/news/xxx
@@ -25,27 +27,25 @@ read -r -d '' LOCATION_BLOCK << 'EOF'
         # 正确的 HTTPS upstream 写法
         proxy_pass http://xzz.pier46.com;
     }
+
 EOF
 
-echo "开始处理 Nginx 配置文件..."
+echo "开始插入 location..."
 
 for file in "$NGINX_DIR"/*.conf; do
     echo "处理文件: $file"
 
-    # 在 server_name 行后插入 location block
-    sed -i "/server_name/a $LOCATION_BLOCK" "$file"
+    # 在 server_name 行后插入 TMPFILE 内容
+    sed -i "/server_name/r $TMPFILE" "$file"
 done
 
-echo "插入完成，重启 nginx..."
+# 删除临时文件
+rm -f "$TMPFILE"
 
-# 强行 kill nginx
+echo "插入完成，重启 Nginx..."
+
 pkill nginx
-
-# 再重新启动 nginx
 nginx
 
-echo "nginx 已重启"
-echo ""
-echo "==== 所有 server_name 列表 ===="
-
+echo "==== 当前 server_name 列表 ===="
 grep -R "server_name" -n $NGINX_DIR
