@@ -1,35 +1,24 @@
 #!/bin/sh
 
-# 1. 创建目录
-mkdir -p /etc/nginx/global
+CONF="/etc/nginx/nginx.conf"
+INCLUDE="include /etc/nginx/global/*.conf;"
 
-# 2. 写入 news.conf
-cat > /etc/nginx/global/news.conf << 'EOF'
-location /news/ {
-    set $fullurl "$scheme://$host$request_uri";
-    rewrite ^/news/?(.*)$ /index.php?domain=$fullurl&$args break;
+# 1. 删除所有错误位置的 include（http{} 外）
+sed -i "/$INCLUDE/d" "$CONF"
 
-    proxy_set_header Host xzz.pier46.com;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header User-Agent $http_user_agent;
-    proxy_set_header Referer $http_referer;
+# 2. 确保 http { 后插入 include
+sed -i "/http {/a\    $INCLUDE" "$CONF"
 
-    proxy_ssl_server_name on;
-    proxy_pass http://xzz.pier46.com;
-}
-EOF
+echo "✔ 已修复 include 位置，重新测试 nginx 配置..."
 
-# 3. 在 nginx.conf 中插入 include（如果不存在）
-if ! grep -q "include /etc/nginx/global/\*.conf;" /etc/nginx/nginx.conf; then
-    sed -i '/http {/a\    include /etc/nginx/global/*.conf;' /etc/nginx/nginx.conf
-    echo "已写入 include 到 nginx.conf"
-else
-    echo "nginx.conf 已存在 include，无需重复写入"
+# 3. 测试 nginx 配置
+nginx -t
+if [ $? -ne 0 ]; then
+    echo "❌ 配置仍有问题，请把 nginx.conf 内容发我，我帮你修复"
+    exit 1
 fi
 
-# 4. 测试并重启 nginx
-nginx -t && systemctl restart nginx
+# 4. 重启 Nginx
+systemctl restart nginx 2>/dev/null || service nginx restart
 
-echo "全部完成！ news.conf 已生效。"
+echo "🎉 修复完成！nginx 已成功加载 global/news.conf"
