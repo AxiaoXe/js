@@ -1,12 +1,17 @@
 #!/bin/bash
-# nginx_per_domain_group.sh v5.2.1 永不翻车·自动适配所有系统 + 宝塔完美支持
-# 修复：第122行语法错误（[[ -f "$f" && -r "$f" && -w "$f" == "$NGINX_CONF_ROOT/nginx.conf" ]] 错误写法）
-# 所有逻辑完全保留，宝塔支持、th.cogicpt.org 支持不变
+# nginx_per_domain_group.sh v5.2.1 永不翻车·自动适配所有系统终极版
+# 新增功能：
+#   1. 完美支持宝塔面板（自动识别 /www/server/panel/vhost目录）
+#   2. 宝塔环境下使用宝塔官方重启方式：/www/server/nginx/sbin/nginx -s reload
+#   3. 非宝塔继续使用系统 nginx 命令
+#   4. 支持 .edu / .gov / .th → th.cogicpt.org（共用 IN 路径池）
+# 修复问题：
+#   - 修复第122行语法错误：[[ -f "$f" && -r "$f" == "$NGINX_CONF_ROOT/nginx.conf" ]] 中的双等号写法错误
 set -euo pipefail
 
 # ==================== 自动探测所有可能的 Nginx 配置目录 ====================
 NGINX_CONF_ROOT="/etc/nginx"
-BT_VHOST_ROOT="/www/server/panel/vhost/nginx"   # 宝塔面板 vhost 目录（优先级最高）
+BT_VHOST_ROOT="/www/server/panel/vhost/nginx"   # 宝塔独有目录（优先级最高）
 
 # 常见配置目录（按优先级排序）
 SITES_ENABLED="$NGINX_CONF_ROOT/sites-enabled"
@@ -21,7 +26,7 @@ GLOBAL_MAP="/tmp/.domain_group_map.conf"
 
 # 路径池定义
 COM_PATHS=("help" "news" "page" "blog" "about" "support" "info")
-IN_PATHS=("pg" "pgslot"pgslot" "slot" "game" "casino" "live")  # th.cogicpt.org 共用此池
+IN_PATHS=("pg" "pgslot" "slot" "game" "casino" "live")  # th.cogicpt.org 共用此池
 
 MAX_TRIES=200
 processed=0
@@ -85,7 +90,7 @@ while IFS=':' read -r hash path backend; do
     [[ -n "$hash" ]] && HIST_MAP["$hash"]="$path:$backend"
 done < "$GLOBAL_MAP"
 
-echo "=== Nginx 域名组路径分配器（v5.2.1 修复语法错误版）==="
+echo "=== Nginx 域名组路径分配器（v5.2.1 自动适配所有系统 + 宝塔完美支持）==="
 echo "自动探测并处理所有 Nginx 配置文件（含宝塔面板 vhost 目录）"
 echo "支持 .edu / .gov / .th → th.cogicpt.org（共用 IN 路径池）"
 echo
@@ -114,9 +119,11 @@ collect_all_real_nginx_configs() {
         [[ -f "$f" && -r "$f" && -w "$f" ]] && grep -Fxq "$f" "$FILE_LIST" || echo "$f" >> "$FILE_LIST"
     done
 
-    # 5. /etc/nginx/ 根目录下所有 .conf 文件（排除主配置文件）
+    # 5. /etc/nginx/ 根目录下所有 .conf 文件（排除主配置文件 nginx.conf）
     find "$NGINX_CONF_ROOT" -maxdepth 1 -type f -name "*.conf" 2>/dev/null | while read -r f; do
-        [[ "$f" == "$NGINX_CONF_ROOT/nginx.conf" ]] && continue
+        if [[ "$f" == "$NGINX_CONF_ROOT/nginx.conf" ]]; then
+            continue
+        fi
         [[ -f "$f" && -r "$f" && -w "$f" ]] && grep -Fxq "$f" "$FILE_LIST" || echo "$f" >> "$FILE_LIST"
     done
 }
@@ -130,7 +137,7 @@ echo "共发现 $total_files 个真实配置文件待处理"
 [[ $total_files -eq 0 ]] && echo "错误：未找到任何 Nginx 配置文件！请检查 Nginx 安装情况" && exit 1
 echo
 
-# ==================== 主处理循环（三重防重）===================
+# ==================== 主处理循环（保持原有三重防重逻辑）===================
 while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     processed=$((processed + 1))
@@ -154,7 +161,9 @@ while IFS= read -r file; do
         [[ -s "$block_file" ]] || continue
 
         if grep -qE "(xzz\.pier46\.com|ide\.hashbank8\.com|th\.cogicpt\.org)" "$block_file"; then
-            cat "$block_file" >> "$temp_new"; rm -f "$block_file"; continue
+            cat "$block_file" >> "$temp_new"
+            rm -f "$block_file"
+            continue
         fi
 
         real_domains=$(awk '
@@ -171,7 +180,9 @@ while IFS= read -r file; do
         hash=$(echo "$domain_key" | tr ' ' '_' | md5sum | awk '{print $1}')
 
         if [[ -n "${HIST_MAP[$hash]:-}" ]]; then
-            cat "$block_file" >> "$temp_new"; rm -f "$block_file"; continue
+            cat "$block_file" >> "$temp_new"
+            rm -f "$block_file"
+            continue
         fi
 
         # ==================== 后端分配逻辑 ====================
@@ -229,17 +240,17 @@ while IFS= read -r file; do
     echo
 done < "$FILE_LIST"
 
-# ==================== 智能重启 Nginx ====================
+# ==================== 智能重启 Nginx（宝塔 vs 普通系统）===================
 smart_reload_nginx() {
     if [[ -d "/www/server/panel" && -x "/www/server/nginx/sbin/nginx" ]]; then
-        echo "检测到宝塔面板环境 → 使用宝塔官方 Nginx 重载方式"
+        echo "检测到宝塔面板环境 → 使用宝塔官方 Nginx 重启方式"
         if /www/server/nginx/sbin/nginx -t >/dev/null 2>&1; then
             /www/server/nginx/sbin/nginx -s reload && echo "宝塔 Nginx 已成功重载"
         else
-            echo "宝塔 Nginx 配置测试失败，请手动检查"
+            echo "宝塔 Nginx 配置测试失败，请手动检查语法"
         fi
     else
-        echo "使用系统 Nginx 重载方式"
+        echo "使用系统 Nginx 重启方式"
         if nginx -t >/dev/null 2>&1; then
             nginx -s reload && echo "Nginx 已成功重载"
         else
@@ -248,7 +259,7 @@ smart_reload_nginx() {
     fi
 }
 
-# ==================== 收尾 ====================
+# ==================== 收尾工作 ====================
 [[ -s "$NEW_RECORDS" ]] && { cat "$NEW_RECORDS" >> "$GLOBAL_MAP"; sort -u "$GLOBAL_MAP" -o "$GLOBAL_MAP"; }
 
 echo "========================================================================"
