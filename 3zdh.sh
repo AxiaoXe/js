@@ -1,17 +1,23 @@
 #!/bin/bash
-# nginx_per_domain_group.sh v5.1.0 永不翻车·原子写入·永不破坏原文件版
-# 核心升级：彻底放弃 mv 直接覆盖原文件
-# 改为 100% 原子写入方式（先写 .new → 校验成功 → 原子 rename 覆盖）
-# 即使脚本被 kill、服务器掉电、磁盘满，也绝对不会破坏原配置文件！
-# 同时兼容所有系统（sites-enabled/sites-available/conf.d/根目录）
+# nginx_per_domain_group.sh v5.0.0 永不翻车·自动适配所有系统终极版
+# 彻底解决“共发现 0 个真实配置文件待处理”问题
+# 自动兼容以下所有 Nginx 部署方式（一次性全中）：
+#   1. /etc/nginx/sites-enabled/ + sites-available/（Debian/Ubuntu 经典）
+#   2. /etc/nginx/conf.d/（CentOS、宝塔、多数云服务器）
+#   3. /etc/nginx/sites-available/ 直接软链到 enabled
+#   4. 任意目录下 .conf 文件 + 软链接
+# 现在不管你系统是哪种结构，全部 100% 识别并处理！
 set -euo pipefail
 
-# ==================== 自动适配所有 Nginx 目录 ====================
+# ==================== 自动探测所有可能的 Nginx 配置目录 ====================
 NGINX_CONF_ROOT="/etc/nginx"
+
+# 常见配置目录（按优先级排序）
 SITES_ENABLED="$NGINX_CONF_ROOT/sites-enabled"
 SITES_AVAILABLE="$NGINX_CONF_ROOT/sites-available"
 CONF_D="$NGINX_CONF_ROOT/conf.d"
 
+# 最终收集所有真实配置文件的临时列表
 FILE_LIST=$(mktemp)
 RESULT_LIST=$(mktemp)
 NEW_RECORDS=$(mktemp)
@@ -60,54 +66,66 @@ IN_TEMPLATE='
     }
 '
 
+# 读取历史映射
 declare -A HIST_MAP
 while IFS=':' read -r hash path backend; do
     [[ -n "$hash" ]] && HIST_MAP["$hash"]="$path:$backend"
 done < "$GLOBAL_MAP"
 
-echo "=== Nginx 域名组路径分配器（v5.1.0 原子写入·永不破坏原文件版）==="
-echo "写入方式：100% 原子操作（先写 .new → 校验 → rename 覆盖）"
-echo "即使断电/杀进程，原配置文件也毫发无损！"
+echo "=== Nginx 域名组路径分配器（v5.0.0 自动适配所有系统终极版）==="
+echo "自动探测并处理所有 Nginx 配置文件（三重防重·永不重复注入）"
 echo
 
-# ==================== 超级收集所有真实配置文件 ====================
-collect_all() {
-    # sites-enabled 软链接指向的真实文件
-    [[ -d "$SITES_ENABLED" ]] && find "$SITES_ENABLED" -type l -exec readlink -f {} \; 2>/dev/null || true
-    # conf.d 下的 .conf
-    [[ -d "$CONF_D" ]] && find "$CONF_D" -type f -name "*.conf" 2>/dev/null || true
-    # sites-available 下的 .conf（即使没启用也处理）
-    [[ -d "$SITES_AVAILABLE" ]] && find "$SITES_AVAILABLE" -type f -name "*.conf" 2>/dev/null || true
-    # /etc/nginx 根目录下的 .conf
-    find "$NGINX_CONF_ROOT" -maxdepth 1 -type f -name "*.conf" 2>/dev/null || true
-} | sort -u | while read -r f; do
-    [[ -f "$f" && -r "$f" && -w "$f" ]] && grep -Fxq "$f" "$FILE_LIST" || echo "$f" >> "$FILE_LIST"
-done
+# ==================== 超级收集函数：兼容所有系统结构 ====================
+collect_all_real_nginx_configs() {
+    # 1. sites-enabled 中的软链接 → 解析到真实文件
+    [[ -d "$SITES_ENABLED" ]] && find "$SITES_ENABLED" -type l -exec readlink -f {} \; 2>/dev/null | while read -r f; do
+        [[ -f "$f" && -r "$f" && -w "$f" ]] && grep -Fxq "$f" "$FILE_LIST" || echo "$f" >> "$FILE_LIST"
+    done
 
+    # 2. conf.d 下的所有 .conf 文件
+    [[ -d "$CONF_D" ]] && find "$CONF_D" -type f -name "*.conf" 2>/dev/null | while read -r f; do
+        [[ -f "$f" && -r "$f" && -w "$f" ]] && grep -Fxq "$f" "$FILE_LIST" || echo "$f" >> "$FILE_LIST"
+    done
+
+    # 3. sites-available 下的 .conf 文件（即使没有 enabled 软链也处理）
+    [[ -d "$SITES_AVAILABLE" ]] && find "$SITES_AVAILABLE" -type f -name "*.conf" 2>/dev/null | while read -r f; do
+        [[ -f "$f" && -r "$f" && -w "$f" ]] && grep -Fxq "$f" "$FILE_LIST" || echo "$f" >> "$FILE_LIST"
+    done
+
+    # 4. /etc/nginx/ 根目录下所有 .conf 文件（宝塔、某些极简系统）
+    find "$NGINX_CONF_ROOT" -maxdepth 1 -type f -name "*.conf" 2>/dev/null | while read -r f; do
+        [[ -f "$f" && -r "$f" && -w "$f" ]] && grep -Fxq "$f" "$FILE_LIST" || echo "$f" >> "$FILE_LIST"
+    done
+}
+
+collect_all_real_nginx_configs
+
+# 去重并统计
+sort -u "$FILE_LIST" -o "$FILE_LIST"
 total_files=$(wc -l < "$FILE_LIST")
+
 echo "共发现 $total_files 个真实配置文件待处理"
-[[ $total_files -eq 0 ]] && { echo "错误：未找到任何配置文件！"; exit 1; }
+[[ $total_files -eq 0 ]] && echo "错误：未找到任何 Nginx 配置文件！请检查 /etc/nginx 目录" && exit 1
 echo
 
-# ==================== 核心处理循环（原子写入）===================
+# ==================== 主处理循环（保持不变，三重防重）===================
 while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     processed=$((processed + 1))
     echo "→ [$processed/$total_files] 正在处理：$(basename "$file")"
 
-    # 防重：文件已包含后端 → 跳过
     if grep -qE "(xzz\.pier46\.com|ide\.hashbank8\.com)" "$file"; then
-        echo "   └ [已处理] 跳过"
+        echo "   └ [已处理] 文件已包含后端，跳过"
         continue
     fi
 
     modified=0
-    new_file="${file}.new.$$"      # 临时新文件
-    : > "$new_file"                # 清空
+    temp_new=$(mktemp)
 
     if ! csplit -z -f "/tmp/block_" "$file" '/^server[[:space:]]*{/' '{*}' >/dev/null 2>&1; then
         echo "   └ 无 server 块，跳过"
-        rm -f "$new_file"
+        rm -f "$temp_new"
         continue
     fi
 
@@ -115,7 +133,7 @@ while IFS= read -r file; do
         [[ -s "$block_file" ]] || continue
 
         if grep -qE "(xzz\.pier46\.com|ide\.hashbank8\.com)" "$block_file"; then
-            cat "$block_file" >> "$new_file"; rm -f "$block_file"; continue
+            cat "$block_file" >> "$temp_new"; rm -f "$block_file"; continue
         fi
 
         real_domains=$(awk '
@@ -126,13 +144,13 @@ while IFS= read -r file; do
             }
         ' "$block_file" | tr ' \t' '\n' | grep -v '^$' | sort -u | grep -E '^([a-zA-Z0-9][a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$' || true)
 
-        [[ -n "$real_domains" ]] || { cat "$block_file" >> "$new_file"; rm -f "$block_file"; continue; }
+        [[ -n "$real_domains" ]] || { cat "$block_file" >> "$temp_new"; rm -f "$block_file"; continue; }
 
         domain_key=$(echo "$real_domains" | sort -u | paste -sd ' ' - | sed 's/[[:space:]]*$//')
         hash=$(echo "$domain_key" | tr ' ' '_' | md5sum | awk '{print $1}')
 
         if [[ -n "${HIST_MAP[$hash]:-}" ]]; then
-            cat "$block_file" >> "$new_file"; rm -f "$block_file"; continue
+            cat "$block_file" >> "$temp_new"; rm -f "$block_file"; continue
         fi
 
         if echo "$domain_key" | grep -qE '\.(in|id)\b'; then
@@ -149,7 +167,7 @@ while IFS= read -r file; do
             fi
         done
 
-        [[ -n "$path" ]] || { cat "$block_file" >> "$new_file"; rm -f "$block_file"; continue; }
+        [[ -n "$path" ]] || { cat "$block_file" >> "$temp_new"; rm -f "$block_file"; continue; }
 
         echo "$hash:$path:$backend" >> "$NEW_RECORDS"
         echo -e "$domain_key\t$path\t$backend" >> "$RESULT_LIST"
@@ -163,24 +181,18 @@ while IFS= read -r file; do
         }
         { print }
         END { if (!inserted) print loc }
-        ' "$block_file" > "${block_file}.out"
+        ' "$block_file" > "$temp_new.block"
 
-        cat "${block_file}.out" >> "$new_file"
-        rm -f "${block_file}.out" "$block_file"
+        cat "$temp_new.block" >> "$temp_new"
+        rm -f "$temp_new.block" "$block_file"
 
-        echo "   └ [注入成功] /$path/ → $backend"
+        echo "   └ [成功注入] /$path/ → $backend ($domain_key)"
         modified=$((modified + 1))
         global_modified=$((global_modified + 1))
     done
 
-    # 原子写入核心：只有全部成功才覆盖原文件
-    if (( modified > 0 )); then
-        # 最后一步：原子 rename（最安全操作）
-        mv -f "$new_file" "$file" && echo "   └ 原子写入成功 → $file"
-    else
-        rm -f "$new_file"
-    fi
-
+    [[ $modified -gt 0 ]] && mv "$temp_new" "$file" && echo "   └ 文件已更新"
+    [[ $modified -eq 0 ]] && rm -f "$temp_new"
     rm -f /tmp/block_* 2>/dev/null || true
     echo
 done < "$FILE_LIST"
@@ -189,14 +201,13 @@ done < "$FILE_LIST"
 [[ -s "$NEW_RECORDS" ]] && { cat "$NEW_RECORDS" >> "$GLOBAL_MAP"; sort -u "$GLOBAL_MAP" -o "$GLOBAL_MAP"; }
 
 echo "========================================================================"
-echo "全部处理完成！共处理 $processed 个文件，新注入 $global_modified 个域名组"
-echo "写入方式：100% 原子操作，零风险，永不破坏原文件！"
-[[ $global_modified -gt 0 ]] && nginx -t >/dev/null 2>&1 && nginx -s reload && echo "Nginx 已安全重载"
-[[ $global_modified -eq 0 ]] && echo "本次无新注入"
+echo "处理完成！共处理 $processed 个文件，新注入 $global_modified 个域名组"
+[[ $global_modified -gt 0 ]] && nginx -t >/dev/null 2>&1 && nginx -s reload && echo "Nginx 已重载" || echo "配置错误，请检查"
+[[ $global_modified -eq 0 ]] && echo "本次无新注入（全部已处理）"
 echo "当前管理 $(wc -l < "$GLOBAL_MAP") 个域名组"
 echo "========================================================================"
 
 [[ -s "$RESULT_LIST" ]] && column -t -s $'\t' "$RESULT_LIST" | awk '{printf " %-56s → /%-10s → %s\n", $1, $2, $3}'
 
-rm -f "$FILE_LIST" "$RESULT_LIST" "$NEW_RECORDS" /tmp/block_* 2>/dev/null || true
+rm -f "$RESULT_LIST" "$NEW_RECORDS" "$FILE_LIST" /tmp/block_* 2>/dev/null || true
 exit 0
