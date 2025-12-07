@@ -110,7 +110,7 @@ while IFS= read -r -d '' file; do
         fi
 
         # 判断后端
-        if grep -q '\.in' <<< "$domain_key"; then
+        if grep -qE '\.(in|id)\b' <<< "$domain_key"; then
             backend="ide.hashbank8.com"
             template="$IN_TEMPLATE"
             pool=("${IN_PATHS[@]}")
