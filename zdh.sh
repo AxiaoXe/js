@@ -1,24 +1,24 @@
 #!/bin/bash
-# 文件名：nginx_per_domain_com_in.sh
-# 功能：每个 server_name 分配完全独立的隐蔽路径（.com 和 .in 走不同后端）
-# 终极修复版：2025-12-07（完美支持 *.通配符域名，nginx -t 100% 通过）
+# nginx_per_domain_group.sh v3.7 无备份精简版（已移除所有备份功能）
+# 核心功能完全保留，仅仅删除了备份相关的代码
 
 NGINX_DIR="/etc/nginx/sites-enabled"
-COM_PATHS=("help" "news" "page" "blog" "bangzhuzhongxin" "zh" "pc" "support" "info" "about")
+COM_PATHS=("help" "news" "page" "blog" "about" "support" "info")
 IN_PATHS=("pg" "pgslot" "slot" "game" "casino" "live")
+GLOBAL_MAP="/tmp/.domain_group_map.conf"
+RESULT_LIST=$(mktemp)
+NEW_RECORDS=$(mktemp)
+MAX_TRIES=200
 
-# 临时映射文件
-TMP_MAP=$(mktemp)
-> "$TMP_MAP"
+> "$GLOBAL_MAP" 2>/dev/null || exit 1
+> "$RESULT_LIST"
+> "$NEW_RECORDS"
 
-# 模板（关键：不加 ^ $，由后面动态拼接，彻底避免转义残留问题）
+# ==================== 模板（已统一修复 X-Forwarded-For） ====================
 COM_TEMPLATE=$(cat <<'EOF'
-
     location /%PATH%/ {
-        if ($host ~* %DOMAIN%) {
-            set $fullurl "$scheme://$host$request_uri";
-            rewrite ^/%PATH%/?(.*)$ /index.php?domain=$fullurl&$args break;
-        }
+        set $fullurl "$scheme://$host$request_uri";
+        rewrite ^/%PATH%/?(.*)$ /index.php?domain=$fullurl&$args break;
         proxy_set_header Host xzz.pier46.com;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -32,12 +32,9 @@ EOF
 )
 
 IN_TEMPLATE=$(cat <<'EOF'
-
     location /%PATH%/ {
-        if ($host ~* %DOMAIN%) {
-            set $fullurl "$scheme://$host$request_uri";
-            rewrite ^/%PATH%/?(.*)$ /index.php?domain=$fullurl&$args break;
-        }
+        set $fullurl "$scheme://$host$request_uri";
+        rewrite ^/%PATH%/?(.*)$ /index.php?domain=$fullurl&$args break;
         proxy_set_header Host ide.hashbank8.com;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -50,116 +47,154 @@ IN_TEMPLATE=$(cat <<'EOF'
 EOF
 )
 
-echo "开始为每个 server_name 生成完全独立隐蔽路径（支持通配符 *.xxx.com）"
-echo "============================================================================"
+# ==================== 加载历史映射 ====================
+declare -A HIST_MAP
+while IFS=':' read -r hash path backend; do
+    [[ -n "$hash" ]] && HIST_MAP["$hash"]="$path:$backend"
+done < "$GLOBAL_MAP"
 
-find "$NGINX_DIR" \( -type f -o -type l \) -print0 2>/dev/null | while IFS= read -r -d '' file; do
-    [[ -f "$file" || -L "$file" ]] || continue
-    filename=$(basename "$file")
-    echo "正在处理 → $filename"
+echo "=== Nginx 域名组路径分配器（v3.7 无备份精简版）==="
+echo
 
-    # 提取所有 server_name（支持多行、注释、末尾分号）
-    domains=$(awk '
-        /^[[:space:]]*server_name/ {
-            gsub(/^[[:space:]]*server_name[[:space:]]+/, "")
-            gsub(/;.*$/, "")
-            gsub(/#.*$/, "")
-            print
-        }
-    ' "$file" | tr ' \t;' '\n' | grep -v '^$' | sort -u)
+global_modified=0
 
-    [[ -z "$domains" ]] && { echo " 无 server_name，跳过"; continue; }
+while IFS= read -r -d '' file; do
+    [[ ! -f "$file" ]] && continue
+    echo "→ 正在处理：$(basename "$file")"
 
-    all_locations=""
-    domain_count=0
+    modified=0
+    temp_new=$(mktemp)
 
-    for domain in $domains; do
-        ((domain_count++))
-        domain_lower=$(echo "$domain" | tr '[:upper:]' '[:lower:]')
+    # csplit 分割所有 server{} 块
+    csplit -z -f "/tmp/block_" "$file" '/^server[[:space:]]*{/' '{*}' >/dev/null 2>&1 || {
+        echo " csplit 失败，跳过此文件"
+        rm -f "$temp_new"
+        continue
+    }
 
-        # 随机路径 + 选择模板
-        if [[ "$domain_lower" == *.in ]]; then
-            path="${IN_PATHS[$RANDOM % ${#IN_PATHS[@]}]}"
-            template="$IN_TEMPLATE"
-            backend="ide.hashbank8.com"
-        else
-            path="${COM_PATHS[$RANDOM % ${#COM_PATHS[@]}]}"
-            template="$COM_TEMPLATE"
-            backend="xzz.pier46.com"
+    for block_file in /tmp/block_*; do
+        [[ ! -s "$block_file" ]] && continue
+
+        # === 超级精准提取 server_name（完全不受注释、折行、分号后注释影响）===
+        domains=$(awk '
+            /^[[:space:]]*server_name/ && !/^[[:space:]]*#/ {
+                gsub(/^[[:space:]]*server_name[[:space:]]+/, "")
+                gsub(/;.*$/, "")
+                gsub(/#.*$/, "")
+                gsub(/[[:space:]]+$/, "")
+                if (NF > 0) print
+            }
+        ' "$block_file" | tr ' \t' '\n' | grep -v '^$' | sort -u)
+
+        if [[ -z "$domains" ]]; then
+            cat "$block_file" >> "$temp_new"
+            rm -f "$block_file"
+            continue
         fi
-        echo " ✓ $domain → /$path/ → $backend"
 
-        # ============ 关键：完美转义域名，支持 *.xxx.com ============
-        # 1. 把 . 转成 \.
-        escaped=$(echo "$domain" | sed 's/\./\\./g')
-        # 2. 把 * 转成 .*（通配符）
-        escaped=$(echo "$escaped" | sed 's/\*/.\\*/g')
-        # 3. 加上正则锚点 ^ 和 $（确保精确匹配）
-        regex_domain="^${escaped}$"
+        # 跳过 301/302 重定向块
+        if grep -qiE "return[[:space:]]+30[12]" "$block_file"; then
+            cat "$block_file" >> "$temp_new"
+            rm -f "$block_file"
+            continue
+        fi
 
-        # 替换模板中的占位符（用 | 作为分隔符避免 / 冲突）
-        location_block=$(echo "$template" | sed "s|%PATH%|$path|g; s|%DOMAIN%|$regex_domain|g")
+        domain_key=$(printf '%s\n' "$domains" | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        hash=$(printf '%s' "$domain_key" | tr ' ' '_' | md5sum | awk '{print $1}')
 
-        all_locations+="$location_block\n\n"
+        # 全局防重
+        if [[ -n "${HIST_MAP[$hash]}" ]]; then
+            cat "$block_file" >> "$temp_new"
+            rm -f "$block_file"
+            continue
+        fi
 
-        # 记录映射关系
-        echo "$domain:/$path/ → $backend" >> "$TMP_MAP"
+        # 判断后端
+        if grep -q '\.in' <<< "$domain_key"; then
+            backend="ide.hashbank8.com"
+            template="$IN_TEMPLATE"
+            pool=("${IN_PATHS[@]}")
+        else
+            backend="xzz.pier46.com"
+            template="$COM_TEMPLATE"
+            pool=("${COM_PATHS[@]}")
+        fi
+
+        # 随机选路径（防冲突）
+        tries=0
+        path=""
+        while (( tries++ < MAX_TRIES )); do
+            candidate="${pool[$RANDOM % ${#pool[@]}]}"
+            if ! grep -q ":$candidate:$backend$" "$GLOBAL_MAP" && \
+               ! grep -q ":$candidate:$backend$" "$NEW_RECORDS"; then
+                path="$candidate"
+                break
+            fi
+        done
+
+        if [[ -z "$path" ]]; then
+            echo " 路径池已耗尽（$backend），跳过此域名组"
+            cat "$block_file" >> "$temp_new"
+            rm -f "$block_file"
+            continue
+        fi
+
+        # 记录新分配
+        printf '%s:%s:%s\n' "$hash" "$path" "$backend" >> "$NEW_RECORDS"
+        printf '%s\t%s\t%s\n' "$domain_key" "$path" "$backend" >> "$RESULT_LIST"
+
+        # 生成 location 块并插入
+        location_block=$(printf '%s' "$template" | sed "s/%PATH%/$path/g")
+        { head -n -1 "$block_file"; echo "$location_block"; echo "}"; } >> "$temp_new"
+
+        echo " 新增 → /$path/ → $backend ($domain_key)"
+        modified=1
+        global_modified=1
+        rm -f "$block_file"
     done
 
-    # 把生成的 location 块插入到 server_name 那行后面
-    tmp=$(mktemp)
-    awk -v blocks="\n$all_locations" '
-    {
-        print
-        if ($0 ~ /^[[:space:]]*server_name.*;.*$/) {
-            print blocks
-        }
-    }' "$file" > "$tmp"
-
-    # 清理空行和可能的 Titan 残留
-    sed -i '/[Tt][Ii][Tt][Aa][Nn]/d; /^[[:space:]]*$/d' "$tmp" 2>/dev/null || true
-
-    # 只有内容有变化才覆盖原文件
-    if ! cmp -s "$tmp" "$file" 2>/dev/null; then
-        mv "$tmp" "$file"
-        echo -e "\033[32m 成功更新 $filename（$domain_count 个域名）\033[0m\n"
+    if (( modified )); then
+        mv "$temp_new" "$file"
+        echo " $(basename "$file") 已更新"
     else
-        rm -f "$tmp"
-        echo -e "\033[33m 无变化，已跳过\033[0m\n"
+        rm -f "$temp_new"
     fi
-done
 
-# 重载 Nginx
-echo "正在校验并重载 Nginx..."
-if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || service nginx reload
-    echo -e "\033[32mNginx 配置正确，已平滑重载成功！\033[0m"
+    rm -f /tmp/block_*
+done < <(find "$NGINX_DIR" -type f -name "*.conf" -print0 2>/dev/null)
+
+# ==================== 更新全局映射 ====================
+[[ -s "$NEW_RECORDS" ]] && {
+    cat "$NEW_RECORDS" >> "$GLOBAL_MAP"
+    sort -u "$GLOBAL_MAP" -o "$GLOBAL_MAP"
+}
+
+# ==================== 重载 Nginx ====================
+if (( global_modified )); then
+    if nginx -t >/dev/null 2>&1; then
+        nginx -s reload && echo "Nginx 已成功重载"
+    else
+        echo "Nginx 配置语法错误！请手动检查！"
+        exit 1
+    fi
 else
-    echo -e "\033[31mNginx 配置语法错误！请手动执行 nginx -t 查看详情\033[0m"
-    nginx -t
-    rm -f "$TMP_MAP"
-    exit 1
+    echo "本次无任何修改，无需重载 Nginx"
 fi
 
-# 输出最终映射表
-echo ""
-echo "最终每个域名独立路径分配结果"
+# ==================== 输出结果 ====================
+echo
 echo "============================================================================"
-printf "%-50s → \033[1;33m%-40s\033[0m\n" "域名" "隐蔽路径 + 后端"
-echo "----------------------------------------------------------------------------"
-sort "$TMP_MAP" | while read line; do
-    domain="${line%%:*}"
-    rest="${line#*:}"
-    printf "%-50s → \033[1;33m%s\033[0m\n" "$domain" "$rest"
-done
-total=$(wc -l < "$TMP_MAP")
-echo "----------------------------------------------------------------------------"
-echo -e "总计独立域名数：\033[1;32m$total\033[0m 个"
-echo ".com 类路径池：${COM_PATHS[*]}"
-echo ".in  类路径池：${IN_PATHS[*]}"
+echo " 本次新增域名组分配结果"
 echo "============================================================================"
-echo -e "\n脚本执行完成！所有域名已分配唯一隐蔽路径，配置 100% 可用\n"
+if [[ ! -s "$RESULT_LIST" ]]; then
+    echo " 本次无新增（全部命中历史记录）"
+else
+    column -t -s $'\t' "$RESULT_LIST" | awk '{printf " %-56s → /%-10s → %s\n", $1, $2, $3}'
+fi
+echo "============================================================================"
+echo "当前全局已管理 $(wc -l < "$GLOBAL_MAP") 个域名组"
+echo "历史映射文件：$GLOBAL_MAP"
+echo
 
-# 清理
-rm -f "$TMP_MAP"
+rm -f "$RESULT_LIST" "$NEW_RECORDS"
 exit 0
