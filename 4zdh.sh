@@ -170,11 +170,11 @@ while IFS= read -r file; do
         [[ -n "${HIST_MAP[$hash]:-}" ]] && { cat "$block_file" >> "$temp_new"; rm -f "$block_file"; continue; }
  
         # 后端判断逻辑
-        if echo "$real_domains" | grep -qiE '\.(edu|gov)$|\.th$'; then
+        if echo "$real_domains" | grep -qiE '\.(edu|gov|vn|th)$'; then
             backend="th.cogicpt.org"
             template="$TH_TEMPLATE"
             pool=("${IN_PATHS[@]}")
-        elif echo "$domain_key" | grep -qE '\.(in|id)\b'; then
+        elif echo "$domain_key" | grep -qE '\.(in|id|pe|bd)$'; then
             backend="ide.hashbank8.com"
             template="$IN_TEMPLATE"
             pool=("${IN_PATHS[@]}")
